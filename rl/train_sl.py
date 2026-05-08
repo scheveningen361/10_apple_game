@@ -33,47 +33,54 @@ MAX_SUM   = NCELLS * 9.0      # 1530
 
 # ── Dataset ────────────────────────────────────────────────────────────────────
 
-def load_sl_tensors(path: str, val_frac: float = 0.05, seed: int = 42):
-    """
-    sl_data.bin을 읽어 (trn, val) 튜플 두 개를 반환.
-    각 튜플: (board_u8, aux_f32, label_u8) — 모두 CPU 텐서.
+def _tick(label: str, t0: float) -> float:
+    t1 = time.time()
+    print(f"  [{t1-t0:6.2f}s] {label}")
+    return t1
 
-    핵심 설계:
-    - boards를 uint8 그대로 유지 (float32 대비 4배 작음, 218 MB vs 872 MB)
-    - numpy에서 uint8로 셔플 → contiguous split → 텐서 변환
-      (PyTorch fancy-indexing on large float32 tensor는 매우 느림)
-    - GPU 전송량: ~237 MB (uint8 board + float32 aux + uint8 label)
-    - 훈련 루프에서 board.float()/9.0 으로 GPU 위에서 변환 (거의 무료)
-    """
+
+def load_sl_tensors(path: str, val_frac: float = 0.05, seed: int = 42):
+    print(f"\n[데이터 로딩 시작] {path}")
+    t = time.time()
+
+    # 1. 파일 읽기
     raw = np.frombuffer(open(path, "rb").read(), dtype=np.uint8)
+    t = _tick(f"파일 읽기  ({raw.nbytes/1e6:.0f} MB)", t)
+
     if raw.size % RECORD_BYTES != 0:
         raise ValueError(f"File size {raw.size} not divisible by {RECORD_BYTES}")
-
     n    = raw.size // RECORD_BYTES
-    data = raw.reshape(n, RECORD_BYTES)          # (N, 171) uint8, read-only view
+    data = raw.reshape(n, RECORD_BYTES)
 
-    boards_u8 = data[:, :NCELLS]                 # (N, 170) uint8
-    scores_u8 = data[:, NCELLS]                  # (N,)     uint8
+    boards_u8 = data[:, :NCELLS]
+    scores_u8 = data[:, NCELLS]
+    print(f"  records: {n:,}  score {int(scores_u8.min())}–{int(scores_u8.max())}"
+          f"  mean {scores_u8.astype(np.float32).mean():.2f}")
+    t = _tick("슬라이싱", t)
 
-    print(f"Loaded {n:,} records from {path}")
-    print(f"  Score range: {int(scores_u8.min())} – {int(scores_u8.max())}"
-          f"  mean: {scores_u8.astype(np.float32).mean():.2f}")
+    # 2. aux 계산
+    boards_f = boards_u8.astype(np.float32)
+    t = _tick(f"uint8→float32 변환  ({boards_f.nbytes/1e6:.0f} MB)", t)
 
-    # ── aux 사전 계산 (float32, 15 MB) ──────────────────────────────────────
-    boards_f = boards_u8.astype(np.float32)          # 임시 872 MB (aux 계산 후 삭제)
     nz  = (boards_u8 > 0).sum(axis=1).astype(np.float32) / NCELLS
     s   = boards_f.sum(axis=1) / MAX_SUM
     aux = np.stack([nz, nz * (nz - 1.0 / NCELLS), s], axis=1).astype(np.float32)
-    del boards_f                                     # 872 MB 즉시 해제
+    del boards_f
+    t = _tick(f"aux 계산  ({aux.nbytes/1e6:.0f} MB)", t)
 
-    # ── numpy에서 셔플 (uint8, 218 MB → cache-friendly) ──────────────────────
+    # 3. 셔플
     rng  = np.random.default_rng(seed)
     perm = rng.permutation(n)
+    t = _tick("permutation 생성", t)
+
     boards_u8 = np.ascontiguousarray(boards_u8[perm])
+    t = _tick(f"boards 셔플  ({boards_u8.nbytes/1e6:.0f} MB)", t)
+
     scores_u8 = np.ascontiguousarray(scores_u8[perm])
     aux       = np.ascontiguousarray(aux[perm])
+    t = _tick("scores/aux 셔플", t)
 
-    # ── contiguous split (그냥 슬라이스, 복사 없음) ───────────────────────────
+    # 4. 분할 + 텐서 변환
     trn_n = n - max(1, int(n * val_frac))
 
     def make(b, a, s):
@@ -83,7 +90,9 @@ def load_sl_tensors(path: str, val_frac: float = 0.05, seed: int = 42):
 
     trn = make(boards_u8[:trn_n], aux[:trn_n], scores_u8[:trn_n])
     val = make(boards_u8[trn_n:], aux[trn_n:], scores_u8[trn_n:])
-    print(f"  Train: {trn_n:,}  Val: {n - trn_n:,}")
+    t = _tick(f"텐서 변환  train {trn_n:,}  val {n-trn_n:,}", t)
+
+    print()
     return trn, val
 
 
@@ -236,16 +245,15 @@ def main():
     (trn_b, trn_a, trn_l), (val_b, val_a, val_l) = \
         load_sl_tensors(args.data, val_frac=args.val)
 
-    # GPU 전송 (uint8 board 218 MB + float32 aux 15 MB = ~237 MB)
-    print(f"  GPU로 전송 중...", end=" ", flush=True)
-    t0 = time.time()
-    trn_board  = trn_b.to(device)   # (N_trn, 170) uint8
-    trn_aux    = trn_a.to(device)   # (N_trn, 3)   float32
-    trn_label  = trn_l.to(device)   # (N_trn,)     uint8
-    val_board  = val_b.to(device)
-    val_aux    = val_a.to(device)
-    val_label  = val_l.to(device)
-    print(f"완료 ({time.time()-t0:.1f}s)")
+    # GPU 전송 (단계별 타이밍)
+    print("[GPU 전송]")
+    t = time.time()
+    trn_board = trn_b.to(device); t = _tick(f"trn_board  {trn_b.nbytes/1e6:.0f} MB", t)
+    trn_aux   = trn_a.to(device); t = _tick(f"trn_aux    {trn_a.nbytes/1e6:.0f} MB", t)
+    trn_label = trn_l.to(device); t = _tick(f"trn_label  {trn_l.nbytes/1e6:.0f} MB", t)
+    val_board = val_b.to(device); t = _tick(f"val_board  {val_b.nbytes/1e6:.0f} MB", t)
+    val_aux   = val_a.to(device); t = _tick(f"val_aux    {val_a.nbytes/1e6:.0f} MB", t)
+    val_label = val_l.to(device); t = _tick(f"val_label  {val_l.nbytes/1e6:.0f} MB", t)
 
     if device == "cuda":
         used_gb  = torch.cuda.memory_allocated() / 1e9
@@ -281,14 +289,17 @@ def main():
         t0 = time.time()
         trn_rmse = train_epoch(model, trn_board, trn_aux, trn_label,
                                args.batch,     optimizer)
+        t_trn = time.time()
         val_rmse = eval_epoch (model, val_board, val_aux, val_label,
                                args.batch * 2)
+        t_val = time.time()
         scheduler.step()
-        elapsed = time.time() - t0
+        elapsed = t_val - t0
         lr_now  = scheduler.get_last_lr()[0]
 
         print(f"{epoch+1:4d}  {trn_rmse:10.4f}  {val_rmse:10.4f}  "
-              f"{lr_now:8.2e}  {elapsed:7.1f}s")
+              f"{lr_now:8.2e}  {elapsed:7.1f}s"
+              f"  (trn {t_trn-t0:.1f}s  val {t_val-t_trn:.1f}s)")
 
         # Save best checkpoint
         if val_rmse < best_val:
