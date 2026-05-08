@@ -22,7 +22,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, TensorDataset, random_split
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 ROWS, COLS = 10, 17
@@ -34,48 +34,40 @@ MAX_SUM   = NCELLS * 9.0      # 1530
 
 # ── Dataset ────────────────────────────────────────────────────────────────────
 
-class SLDataset(Dataset):
+def load_sl_dataset(path: str) -> TensorDataset:
     """
     Reads the flat binary file produced by `go run . -gen-sl`.
-    Each record: 171 bytes = [170 uint8 board values] [1 uint8 greedy score].
-    Returns (board_tensor, aux_tensor, label).
+    각 레코드: 171 bytes = [170 uint8 board values] [1 uint8 greedy score].
+
+    aux 특징을 로드 시점에 전부 벡터 연산으로 사전 계산 → __getitem__ 오버헤드 제거.
+    모든 데이터를 Tensor로 변환해 TensorDataset 반환 (가장 빠른 DataLoader 경로).
     """
+    raw = np.frombuffer(open(path, "rb").read(), dtype=np.uint8)
+    if raw.size % RECORD_BYTES != 0:
+        raise ValueError(f"File size {raw.size} not divisible by {RECORD_BYTES}")
 
-    def __init__(self, path: str):
-        data = np.frombuffer(open(path, "rb").read(), dtype=np.uint8)
-        if data.size % RECORD_BYTES != 0:
-            raise ValueError(
-                f"File size {data.size} not divisible by {RECORD_BYTES}"
-            )
-        n = data.size // RECORD_BYTES
-        data = data.reshape(n, RECORD_BYTES)
-        self.boards = data[:, :NCELLS].astype(np.float32) / 9.0  # (N, 170)
-        self.scores = data[:, NCELLS].astype(np.float32)          # (N,)  raw 0-170
-        self.n = n
-        print(f"Loaded {n:,} records from {path}")
-        print(f"  Score range: {self.scores.min():.0f} – {self.scores.max():.0f}"
-              f"  mean: {self.scores.mean():.2f}")
+    n    = raw.size // RECORD_BYTES
+    data = raw.reshape(n, RECORD_BYTES)
 
-    def __len__(self):
-        return self.n
+    boards_u8 = data[:, :NCELLS]                         # (N, 170) uint8  0-9
+    scores_f  = data[:, NCELLS].astype(np.float32)       # (N,)     0-170
 
-    def __getitem__(self, idx):
-        board_flat = self.boards[idx]          # (170,) float32
-        board_2d   = board_flat.reshape(1, ROWS, COLS)  # (1,10,17)
+    print(f"Loaded {n:,} records from {path}")
+    print(f"  Score range: {scores_f.min():.0f} – {scores_f.max():.0f}"
+          f"  mean: {scores_f.mean():.2f}")
 
-        # Auxiliary features (hand-crafted global statistics):
-        #   ① remaining non-zero cells / 170
-        #   ② valid-rect count proxy: nz*(nz-1)/2 / MAX_RECTS  (cheap approx)
-        #   ③ remaining cell sum / MAX_SUM
-        raw = self.boards[idx] * 9.0           # un-normalise to 0-9
-        nz  = float((raw > 0).sum()) / NCELLS
-        s   = float(raw.sum()) / MAX_SUM
-        # Valid-rect count proxy: use nz count as simple feature
-        # (exact count too expensive to compute in Python; model will learn)
-        aux = np.array([nz, nz * (nz - 1 / NCELLS), s], dtype=np.float32)
+    # ── Aux 특징 사전 계산 (벡터 연산, 한 번만) ─────────────────────────────────
+    boards_f = boards_u8.astype(np.float32)              # 0-9
+    nz = (boards_u8 > 0).sum(axis=1).astype(np.float32) / NCELLS   # (N,)
+    s  = boards_f.sum(axis=1) / MAX_SUM                             # (N,)
+    aux = np.stack([nz, nz * (nz - 1.0 / NCELLS), s], axis=1)      # (N, 3)
 
-        label = self.scores[idx] / MAX_SCORE   # normalise to [0,1]
-        return board_2d, aux, label
+    # ── Tensor 변환 ────────────────────────────────────────────────────────────
+    board_t = torch.from_numpy(boards_f / 9.0).reshape(n, 1, ROWS, COLS)  # (N,1,10,17)
+    aux_t   = torch.from_numpy(aux.astype(np.float32))                     # (N, 3)
+    label_t = torch.from_numpy(scores_f / MAX_SCORE)                       # (N,)
+
+    return TensorDataset(board_t, aux_t, label_t)
 
 
 # ── Model ──────────────────────────────────────────────────────────────────────
@@ -212,21 +204,22 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
 
-    # Dataset
-    dataset = SLDataset(args.data)
+    # Dataset — aux 사전 계산 + TensorDataset으로 __getitem__ 오버헤드 제거
+    dataset = load_sl_dataset(args.data)
     val_n   = max(1, int(len(dataset) * args.val))
     trn_n   = len(dataset) - val_n
     trn_ds, val_ds = random_split(
         dataset, [trn_n, val_n],
         generator=torch.Generator().manual_seed(42)
     )
+    # TensorDataset은 num_workers=0 이 가장 빠름 (이미 메모리에 올라있음)
     trn_loader = DataLoader(
         trn_ds, batch_size=args.batch, shuffle=True,
-        num_workers=args.workers, pin_memory=(device == "cuda"), drop_last=True
+        num_workers=0, pin_memory=False, drop_last=True
     )
     val_loader = DataLoader(
         val_ds, batch_size=args.batch * 2, shuffle=False,
-        num_workers=args.workers, pin_memory=(device == "cuda")
+        num_workers=0, pin_memory=False
     )
 
     # Model
