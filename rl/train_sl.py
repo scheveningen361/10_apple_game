@@ -22,7 +22,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset, random_split
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 ROWS, COLS = 10, 17
@@ -34,13 +33,15 @@ MAX_SUM   = NCELLS * 9.0      # 1530
 
 # ── Dataset ────────────────────────────────────────────────────────────────────
 
-def load_sl_dataset(path: str) -> TensorDataset:
+def load_sl_tensors(path: str):
     """
-    Reads the flat binary file produced by `go run . -gen-sl`.
-    각 레코드: 171 bytes = [170 uint8 board values] [1 uint8 greedy score].
+    Reads sl_data.bin and returns (board_t, aux_t, label_t) as CPU float32 tensors.
+    aux 특징을 numpy 벡터 연산으로 한 번에 계산 → per-sample 오버헤드 없음.
 
-    aux 특징을 로드 시점에 전부 벡터 연산으로 사전 계산 → __getitem__ 오버헤드 제거.
-    모든 데이터를 Tensor로 변환해 TensorDataset 반환 (가장 빠른 DataLoader 경로).
+    Returns:
+        board_t : (N, 1, 10, 17) float32
+        aux_t   : (N, 3)         float32
+        label_t : (N,)           float32  [0, 1] 정규화
     """
     raw = np.frombuffer(open(path, "rb").read(), dtype=np.uint8)
     if raw.size % RECORD_BYTES != 0:
@@ -49,25 +50,24 @@ def load_sl_dataset(path: str) -> TensorDataset:
     n    = raw.size // RECORD_BYTES
     data = raw.reshape(n, RECORD_BYTES)
 
-    boards_u8 = data[:, :NCELLS]                         # (N, 170) uint8  0-9
-    scores_f  = data[:, NCELLS].astype(np.float32)       # (N,)     0-170
+    boards_u8 = data[:, :NCELLS]                          # (N, 170) uint8
+    scores_f  = data[:, NCELLS].astype(np.float32)        # (N,)
 
     print(f"Loaded {n:,} records from {path}")
     print(f"  Score range: {scores_f.min():.0f} – {scores_f.max():.0f}"
           f"  mean: {scores_f.mean():.2f}")
 
-    # ── Aux 특징 사전 계산 (벡터 연산, 한 번만) ─────────────────────────────────
-    boards_f = boards_u8.astype(np.float32)              # 0-9
-    nz = (boards_u8 > 0).sum(axis=1).astype(np.float32) / NCELLS   # (N,)
-    s  = boards_f.sum(axis=1) / MAX_SUM                             # (N,)
-    aux = np.stack([nz, nz * (nz - 1.0 / NCELLS), s], axis=1)      # (N, 3)
+    # aux 사전 계산 (벡터 연산)
+    boards_f = boards_u8.astype(np.float32)
+    nz = (boards_u8 > 0).sum(axis=1).astype(np.float32) / NCELLS
+    s  = boards_f.sum(axis=1) / MAX_SUM
+    aux = np.stack([nz, nz * (nz - 1.0 / NCELLS), s], axis=1).astype(np.float32)
 
-    # ── Tensor 변환 ────────────────────────────────────────────────────────────
-    board_t = torch.from_numpy(boards_f / 9.0).reshape(n, 1, ROWS, COLS)  # (N,1,10,17)
-    aux_t   = torch.from_numpy(aux.astype(np.float32))                     # (N, 3)
-    label_t = torch.from_numpy(scores_f / MAX_SCORE)                       # (N,)
+    board_t = torch.from_numpy(boards_f / 9.0).reshape(n, 1, ROWS, COLS)
+    aux_t   = torch.from_numpy(aux)
+    label_t = torch.from_numpy(scores_f / MAX_SCORE)
 
-    return TensorDataset(board_t, aux_t, label_t)
+    return board_t, aux_t, label_t
 
 
 # ── Model ──────────────────────────────────────────────────────────────────────
@@ -122,41 +122,45 @@ def count_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-# ── Training helpers ───────────────────────────────────────────────────────────
+# ── Training helpers (GPU-resident 텐서 직접 배치) ────────────────────────────
+#
+# DataLoader 없이 GPU 위의 텐서를 torch.randperm으로 셔플 후 슬라이싱.
+# CPU↔GPU 전송이 epoch당 딱 1회(최초 .to(device))만 발생 → 수십 배 빠름.
 
-def train_epoch(model, loader, optimizer, device):
+def train_epoch(model, boards, aux, labels, batch_size, optimizer):
+    """boards/aux/labels 는 이미 GPU 위에 있는 텐서."""
     model.train()
+    n          = len(labels)
+    perm       = torch.randperm(n, device=boards.device)
     total_loss = 0.0
-    n = 0
-    for boards, aux, labels in loader:
-        boards = boards.to(device)
-        aux    = aux.to(device)
-        labels = labels.to(device)
-        pred   = model(boards, aux)
-        loss   = F.mse_loss(pred, labels)
+    steps      = 0
+    for start in range(0, n - batch_size + 1, batch_size):
+        idx   = perm[start: start + batch_size]
+        pred  = model(boards[idx], aux[idx])
+        loss  = F.mse_loss(pred, labels[idx])
         optimizer.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
-        total_loss += loss.item() * len(labels)
-        n += len(labels)
-    return math.sqrt(total_loss / n) * MAX_SCORE   # RMSE in raw score units
+        total_loss += loss.item()
+        steps      += 1
+    return math.sqrt(total_loss / steps) * MAX_SCORE   # RMSE in raw units
 
 
 @torch.no_grad()
-def eval_epoch(model, loader, device):
+def eval_epoch(model, boards, aux, labels, batch_size):
+    """boards/aux/labels 는 이미 GPU 위에 있는 텐서."""
     model.eval()
+    n          = len(labels)
     total_loss = 0.0
-    n = 0
-    for boards, aux, labels in loader:
-        boards = boards.to(device)
-        aux    = aux.to(device)
-        labels = labels.to(device)
-        pred   = model(boards, aux)
-        loss   = F.mse_loss(pred, labels)
-        total_loss += loss.item() * len(labels)
-        n += len(labels)
-    return math.sqrt(total_loss / n) * MAX_SCORE   # RMSE in raw score units
+    steps      = 0
+    for start in range(0, n, batch_size):
+        end  = min(start + batch_size, n)
+        pred = model(boards[start:end], aux[start:end])
+        loss = F.mse_loss(pred, labels[start:end])
+        total_loss += loss.item()
+        steps      += 1
+    return math.sqrt(total_loss / steps) * MAX_SCORE
 
 
 # ── ONNX export ────────────────────────────────────────────────────────────────
@@ -196,31 +200,39 @@ def main():
     parser.add_argument("--blocks",  type=int,   default=6)
     parser.add_argument("--val",     type=float, default=0.05,
                         help="validation fraction")
-    parser.add_argument("--workers", type=int,   default=4,
-                        help="DataLoader num_workers")
     parser.add_argument("--resume",  default="", help="resume from checkpoint")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
 
-    # Dataset — aux 사전 계산 + TensorDataset으로 __getitem__ 오버헤드 제거
-    dataset = load_sl_dataset(args.data)
-    val_n   = max(1, int(len(dataset) * args.val))
-    trn_n   = len(dataset) - val_n
-    trn_ds, val_ds = random_split(
-        dataset, [trn_n, val_n],
-        generator=torch.Generator().manual_seed(42)
-    )
-    # TensorDataset은 num_workers=0 이 가장 빠름 (이미 메모리에 올라있음)
-    trn_loader = DataLoader(
-        trn_ds, batch_size=args.batch, shuffle=True,
-        num_workers=0, pin_memory=False, drop_last=True
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=args.batch * 2, shuffle=False,
-        num_workers=0, pin_memory=False
-    )
+    # 데이터 로드 + GPU 전송 (1회만 발생)
+    board_t, aux_t, label_t = load_sl_tensors(args.data)
+    n     = len(label_t)
+    val_n = max(1, int(n * args.val))
+    trn_n = n - val_n
+
+    # 재현 가능한 분할
+    perm_split = torch.randperm(n, generator=torch.Generator().manual_seed(42))
+    trn_idx = perm_split[:trn_n]
+    val_idx = perm_split[trn_n:]
+
+    print(f"  Train: {trn_n:,}  Val: {val_n:,}")
+    print(f"  GPU로 전송 중...", end=" ", flush=True)
+    t_load = time.time()
+    trn_board  = board_t[trn_idx].to(device)
+    trn_aux    = aux_t  [trn_idx].to(device)
+    trn_label  = label_t[trn_idx].to(device)
+    val_board  = board_t[val_idx].to(device)
+    val_aux    = aux_t  [val_idx].to(device)
+    val_label  = label_t[val_idx].to(device)
+    print(f"완료 ({time.time()-t_load:.1f}s)")
+
+    # 메모리 사용량 출력
+    if device == "cuda":
+        used_gb = torch.cuda.memory_allocated() / 1e9
+        total_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+        print(f"  VRAM 사용: {used_gb:.2f} / {total_gb:.1f} GB")
 
     # Model
     model = AppleNetSL(channels=args.channels, n_blocks=args.blocks).to(device)
@@ -249,8 +261,10 @@ def main():
 
     for epoch in range(start_epoch, args.epochs):
         t0 = time.time()
-        trn_rmse = train_epoch(model, trn_loader, optimizer, device)
-        val_rmse = eval_epoch (model, val_loader,             device)
+        trn_rmse = train_epoch(model, trn_board, trn_aux, trn_label,
+                               args.batch, optimizer)
+        val_rmse = eval_epoch (model, val_board, val_aux, val_label,
+                               args.batch * 2)
         scheduler.step()
         elapsed = time.time() - t0
         lr_now  = scheduler.get_last_lr()[0]
