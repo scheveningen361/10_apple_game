@@ -33,41 +33,58 @@ MAX_SUM   = NCELLS * 9.0      # 1530
 
 # ── Dataset ────────────────────────────────────────────────────────────────────
 
-def load_sl_tensors(path: str):
+def load_sl_tensors(path: str, val_frac: float = 0.05, seed: int = 42):
     """
-    Reads sl_data.bin and returns (board_t, aux_t, label_t) as CPU float32 tensors.
-    aux 특징을 numpy 벡터 연산으로 한 번에 계산 → per-sample 오버헤드 없음.
+    sl_data.bin을 읽어 (trn, val) 튜플 두 개를 반환.
+    각 튜플: (board_u8, aux_f32, label_u8) — 모두 CPU 텐서.
 
-    Returns:
-        board_t : (N, 1, 10, 17) float32
-        aux_t   : (N, 3)         float32
-        label_t : (N,)           float32  [0, 1] 정규화
+    핵심 설계:
+    - boards를 uint8 그대로 유지 (float32 대비 4배 작음, 218 MB vs 872 MB)
+    - numpy에서 uint8로 셔플 → contiguous split → 텐서 변환
+      (PyTorch fancy-indexing on large float32 tensor는 매우 느림)
+    - GPU 전송량: ~237 MB (uint8 board + float32 aux + uint8 label)
+    - 훈련 루프에서 board.float()/9.0 으로 GPU 위에서 변환 (거의 무료)
     """
     raw = np.frombuffer(open(path, "rb").read(), dtype=np.uint8)
     if raw.size % RECORD_BYTES != 0:
         raise ValueError(f"File size {raw.size} not divisible by {RECORD_BYTES}")
 
     n    = raw.size // RECORD_BYTES
-    data = raw.reshape(n, RECORD_BYTES)
+    data = raw.reshape(n, RECORD_BYTES)          # (N, 171) uint8, read-only view
 
-    boards_u8 = data[:, :NCELLS]                          # (N, 170) uint8
-    scores_f  = data[:, NCELLS].astype(np.float32)        # (N,)
+    boards_u8 = data[:, :NCELLS]                 # (N, 170) uint8
+    scores_u8 = data[:, NCELLS]                  # (N,)     uint8
 
     print(f"Loaded {n:,} records from {path}")
-    print(f"  Score range: {scores_f.min():.0f} – {scores_f.max():.0f}"
-          f"  mean: {scores_f.mean():.2f}")
+    print(f"  Score range: {int(scores_u8.min())} – {int(scores_u8.max())}"
+          f"  mean: {scores_u8.astype(np.float32).mean():.2f}")
 
-    # aux 사전 계산 (벡터 연산)
-    boards_f = boards_u8.astype(np.float32)
-    nz = (boards_u8 > 0).sum(axis=1).astype(np.float32) / NCELLS
-    s  = boards_f.sum(axis=1) / MAX_SUM
+    # ── aux 사전 계산 (float32, 15 MB) ──────────────────────────────────────
+    boards_f = boards_u8.astype(np.float32)          # 임시 872 MB (aux 계산 후 삭제)
+    nz  = (boards_u8 > 0).sum(axis=1).astype(np.float32) / NCELLS
+    s   = boards_f.sum(axis=1) / MAX_SUM
     aux = np.stack([nz, nz * (nz - 1.0 / NCELLS), s], axis=1).astype(np.float32)
+    del boards_f                                     # 872 MB 즉시 해제
 
-    board_t = torch.from_numpy(boards_f / 9.0).reshape(n, 1, ROWS, COLS)
-    aux_t   = torch.from_numpy(aux)
-    label_t = torch.from_numpy(scores_f / MAX_SCORE)
+    # ── numpy에서 셔플 (uint8, 218 MB → cache-friendly) ──────────────────────
+    rng  = np.random.default_rng(seed)
+    perm = rng.permutation(n)
+    boards_u8 = np.ascontiguousarray(boards_u8[perm])
+    scores_u8 = np.ascontiguousarray(scores_u8[perm])
+    aux       = np.ascontiguousarray(aux[perm])
 
-    return board_t, aux_t, label_t
+    # ── contiguous split (그냥 슬라이스, 복사 없음) ───────────────────────────
+    trn_n = n - max(1, int(n * val_frac))
+
+    def make(b, a, s):
+        return (torch.from_numpy(b.copy()),
+                torch.from_numpy(a.copy()),
+                torch.from_numpy(s.copy()))
+
+    trn = make(boards_u8[:trn_n], aux[:trn_n], scores_u8[:trn_n])
+    val = make(boards_u8[trn_n:], aux[trn_n:], scores_u8[trn_n:])
+    print(f"  Train: {trn_n:,}  Val: {n - trn_n:,}")
+    return trn, val
 
 
 # ── Model ──────────────────────────────────────────────────────────────────────
@@ -127,37 +144,46 @@ def count_params(model: nn.Module) -> int:
 # DataLoader 없이 GPU 위의 텐서를 torch.randperm으로 셔플 후 슬라이싱.
 # CPU↔GPU 전송이 epoch당 딱 1회(최초 .to(device))만 발생 → 수십 배 빠름.
 
+def _prep(boards_u8, aux, labels_u8):
+    """uint8 board/label → float32, reshape board. GPU 위에서 실행."""
+    b = boards_u8.float().mul_(1.0 / 9.0).reshape(-1, 1, ROWS, COLS)
+    l = labels_u8.float().mul_(1.0 / MAX_SCORE)
+    return b, aux, l
+
+
 def train_epoch(model, boards, aux, labels, batch_size, optimizer):
-    """boards/aux/labels 는 이미 GPU 위에 있는 텐서."""
+    """boards: (N,170) uint8 GPU  aux: (N,3) float32 GPU  labels: (N,) uint8 GPU"""
     model.train()
     n          = len(labels)
     perm       = torch.randperm(n, device=boards.device)
     total_loss = 0.0
     steps      = 0
     for start in range(0, n - batch_size + 1, batch_size):
-        idx   = perm[start: start + batch_size]
-        pred  = model(boards[idx], aux[idx])
-        loss  = F.mse_loss(pred, labels[idx])
+        idx          = perm[start: start + batch_size]
+        b, a, l      = _prep(boards[idx], aux[idx], labels[idx])
+        pred         = model(b, a)
+        loss         = F.mse_loss(pred, l)
         optimizer.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
-        total_loss += loss.item()
-        steps      += 1
-    return math.sqrt(total_loss / steps) * MAX_SCORE   # RMSE in raw units
+        total_loss  += loss.item()
+        steps       += 1
+    return math.sqrt(total_loss / steps) * MAX_SCORE
 
 
 @torch.no_grad()
 def eval_epoch(model, boards, aux, labels, batch_size):
-    """boards/aux/labels 는 이미 GPU 위에 있는 텐서."""
+    """boards: (N,170) uint8 GPU  aux: (N,3) float32 GPU  labels: (N,) uint8 GPU"""
     model.eval()
     n          = len(labels)
     total_loss = 0.0
     steps      = 0
     for start in range(0, n, batch_size):
-        end  = min(start + batch_size, n)
-        pred = model(boards[start:end], aux[start:end])
-        loss = F.mse_loss(pred, labels[start:end])
+        end      = min(start + batch_size, n)
+        b, a, l  = _prep(boards[start:end], aux[start:end], labels[start:end])
+        pred     = model(b, a)
+        loss     = F.mse_loss(pred, l)
         total_loss += loss.item()
         steps      += 1
     return math.sqrt(total_loss / steps) * MAX_SCORE
@@ -206,31 +232,23 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
 
-    # 데이터 로드 + GPU 전송 (1회만 발생)
-    board_t, aux_t, label_t = load_sl_tensors(args.data)
-    n     = len(label_t)
-    val_n = max(1, int(n * args.val))
-    trn_n = n - val_n
+    # 데이터 로드 (numpy에서 셔플+분할, uint8 유지)
+    (trn_b, trn_a, trn_l), (val_b, val_a, val_l) = \
+        load_sl_tensors(args.data, val_frac=args.val)
 
-    # 재현 가능한 분할
-    perm_split = torch.randperm(n, generator=torch.Generator().manual_seed(42))
-    trn_idx = perm_split[:trn_n]
-    val_idx = perm_split[trn_n:]
-
-    print(f"  Train: {trn_n:,}  Val: {val_n:,}")
+    # GPU 전송 (uint8 board 218 MB + float32 aux 15 MB = ~237 MB)
     print(f"  GPU로 전송 중...", end=" ", flush=True)
-    t_load = time.time()
-    trn_board  = board_t[trn_idx].to(device)
-    trn_aux    = aux_t  [trn_idx].to(device)
-    trn_label  = label_t[trn_idx].to(device)
-    val_board  = board_t[val_idx].to(device)
-    val_aux    = aux_t  [val_idx].to(device)
-    val_label  = label_t[val_idx].to(device)
-    print(f"완료 ({time.time()-t_load:.1f}s)")
+    t0 = time.time()
+    trn_board  = trn_b.to(device)   # (N_trn, 170) uint8
+    trn_aux    = trn_a.to(device)   # (N_trn, 3)   float32
+    trn_label  = trn_l.to(device)   # (N_trn,)     uint8
+    val_board  = val_b.to(device)
+    val_aux    = val_a.to(device)
+    val_label  = val_l.to(device)
+    print(f"완료 ({time.time()-t0:.1f}s)")
 
-    # 메모리 사용량 출력
     if device == "cuda":
-        used_gb = torch.cuda.memory_allocated() / 1e9
+        used_gb  = torch.cuda.memory_allocated() / 1e9
         total_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
         print(f"  VRAM 사용: {used_gb:.2f} / {total_gb:.1f} GB")
 
@@ -262,7 +280,7 @@ def main():
     for epoch in range(start_epoch, args.epochs):
         t0 = time.time()
         trn_rmse = train_epoch(model, trn_board, trn_aux, trn_label,
-                               args.batch, optimizer)
+                               args.batch,     optimizer)
         val_rmse = eval_epoch (model, val_board, val_aux, val_label,
                                args.batch * 2)
         scheduler.step()
