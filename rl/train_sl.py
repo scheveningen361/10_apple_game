@@ -160,7 +160,7 @@ def _prep(boards_u8, aux, labels_u8):
     return b, aux, l
 
 
-def train_epoch(model, boards, aux, labels, batch_size, optimizer):
+def train_epoch(model, boards, aux, labels, batch_size, optimizer, scaler):
     """boards: (N,170) uint8 GPU  aux: (N,3) float32 GPU  labels: (N,) uint8 GPU"""
     model.train()
     n          = len(labels)
@@ -168,16 +168,19 @@ def train_epoch(model, boards, aux, labels, batch_size, optimizer):
     total_loss = 0.0
     steps      = 0
     for start in range(0, n - batch_size + 1, batch_size):
-        idx          = perm[start: start + batch_size]
-        b, a, l      = _prep(boards[idx], aux[idx], labels[idx])
-        pred         = model(b, a)
-        loss         = F.mse_loss(pred, l)
+        idx     = perm[start: start + batch_size]
+        b, a, l = _prep(boards[idx], aux[idx], labels[idx])
         optimizer.zero_grad()
-        loss.backward()
+        with torch.amp.autocast("cuda"):
+            pred = model(b, a)
+            loss = F.mse_loss(pred, l)
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
         nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        total_loss  += loss.item()
-        steps       += 1
+        scaler.step(optimizer)
+        scaler.update()
+        total_loss += loss.item()
+        steps      += 1
     return math.sqrt(total_loss / steps) * MAX_SCORE
 
 
@@ -189,10 +192,11 @@ def eval_epoch(model, boards, aux, labels, batch_size):
     total_loss = 0.0
     steps      = 0
     for start in range(0, n, batch_size):
-        end      = min(start + batch_size, n)
-        b, a, l  = _prep(boards[start:end], aux[start:end], labels[start:end])
-        pred     = model(b, a)
-        loss     = F.mse_loss(pred, l)
+        end     = min(start + batch_size, n)
+        b, a, l = _prep(boards[start:end], aux[start:end], labels[start:end])
+        with torch.amp.autocast("cuda"):
+            pred = model(b, a)
+            loss = F.mse_loss(pred, l)
         total_loss += loss.item()
         steps      += 1
     return math.sqrt(total_loss / steps) * MAX_SCORE
@@ -228,7 +232,7 @@ def main():
     parser.add_argument("--out",     default="model_sl.pt",  help="output .pt checkpoint")
     parser.add_argument("--export",  default="",             help="also export to ONNX at this path")
     parser.add_argument("--epochs",  type=int,   default=50)
-    parser.add_argument("--batch",   type=int,   default=2048)
+    parser.add_argument("--batch",   type=int,   default=4096)
     parser.add_argument("--lr",      type=float, default=1e-3)
     parser.add_argument("--wd",      type=float, default=1e-4)
     parser.add_argument("--channels",type=int,   default=128)
@@ -269,6 +273,7 @@ def main():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, eta_min=args.lr * 0.01
     )
+    scaler = torch.amp.GradScaler("cuda", enabled=(device == "cuda"))
 
     start_epoch = 0
     best_val    = float("inf")
@@ -282,13 +287,15 @@ def main():
         best_val    = ckpt.get("best_val", float("inf"))
         print(f"Resumed from epoch {start_epoch}  best_val_rmse={best_val:.4f}")
 
+    amp_str = "AMP(FP16)" if device == "cuda" else "FP32"
+    print(f"Mixed precision: {amp_str}")
     print(f"\n{'Ep':>4}  {'Trn RMSE':>10}  {'Val RMSE':>10}  {'LR':>8}  {'Time':>8}")
     print("-" * 50)
 
     for epoch in range(start_epoch, args.epochs):
         t0 = time.time()
         trn_rmse = train_epoch(model, trn_board, trn_aux, trn_label,
-                               args.batch,     optimizer)
+                               args.batch, optimizer, scaler)
         t_trn = time.time()
         val_rmse = eval_epoch (model, val_board, val_aux, val_label,
                                args.batch * 2)

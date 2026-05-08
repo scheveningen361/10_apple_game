@@ -40,7 +40,6 @@ cells.append(code(
     "\n"
     "# Phase 2 SL\n"
     "SL_EPOCHS = 50\n"
-    "SL_BATCH  = 2048\n"
     "\n"
     "# Phase 3 RL\n"
     "RL_ITERS  = 200   # PPO 업데이트 횟수\n"
@@ -107,12 +106,11 @@ cells.append(code(
 cells.append(md("---\n## 🎓 Phase 2: Supervised Learning"))
 
 cells.append(code(
-    "# SL 학습 (50 epochs, T4 기준 ~10 min)\n"
+    "# SL 학습 (50 epochs, T4 기준 AMP FP16 ~5 min)\n"
     "!python train_sl.py \\\n"
     "    --data   sl_data.bin \\\n"
     "    --out    model_sl.pt \\\n"
-    "    --epochs {SL_EPOCHS} \\\n"
-    "    --batch  {SL_BATCH}"
+    "    --epochs {SL_EPOCHS}"
 ))
 
 cells.append(code(
