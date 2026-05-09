@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python \"D:/Documents/Github/10_apple_game/rl/gen_notebook.py\")",
+      "Bash(git -C \"D:/Documents/Github/10_apple_game\" add rl/colab.ipynb rl/gen_notebook.py)",
+      "Bash(git -C D:/Documents/Github/10_apple_game commit -m ' *)",
+      "Bash(git -C \"D:/Documents/Github/10_apple_game\" push)"
+    ]
+  }
+}

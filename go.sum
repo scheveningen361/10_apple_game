@@ -1,0 +1,8 @@
+github.com/yalue/onnxruntime_go v1.9.0 h1:AhgkpBjphJZsHT5karKt93xPkPFNP0Iz6ENUbNAFQU4=
+github.com/yalue/onnxruntime_go v1.9.0/go.mod h1:b4X26A8pekNb1ACJ58wAXgNKeUCGEAQ9dmACut9Sm/4=
+github.com/yalue/onnxruntime_go v1.10.0 h1:om1yzOQYv/4GlsSP5HIZvS6G3WF3THv4x5rhO5AFERU=
+github.com/yalue/onnxruntime_go v1.10.0/go.mod h1:b4X26A8pekNb1ACJ58wAXgNKeUCGEAQ9dmACut9Sm/4=
+github.com/yalue/onnxruntime_go v1.17.0 h1:nC8AFbmaq9E2gxtxutGPzK/LGCrtnnu7LTGl82YuQzw=
+github.com/yalue/onnxruntime_go v1.17.0/go.mod h1:b4X26A8pekNb1ACJ58wAXgNKeUCGEAQ9dmACut9Sm/4=
+github.com/yalue/onnxruntime_go v1.27.0 h1:c1YSgDNtpf0WGtxj3YeRIb8VC5LmM1J+Ve3uHdteC1U=
+github.com/yalue/onnxruntime_go v1.27.0/go.mod h1:b4X26A8pekNb1ACJ58wAXgNKeUCGEAQ9dmACut9Sm/4=
