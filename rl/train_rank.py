@@ -239,6 +239,8 @@ def run_epoch(model, data, group_ids, buckets, args, optimizer, scaler, device, 
 def export_onnx(model, path, device):
     if importlib.util.find_spec("onnx") is None:
         raise RuntimeError("ONNX export requires the Python package 'onnx'. Install it with: pip install onnx")
+    if importlib.util.find_spec("onnxscript") is None:
+        raise RuntimeError("ONNX export requires the Python package 'onnxscript'. Install it with: pip install onnxscript")
 
     model.eval().to(device)
     dummy_board = torch.zeros(1, 1, ROWS, COLS, device=device)
@@ -250,7 +252,8 @@ def export_onnx(model, path, device):
         input_names=["board", "aux"],
         output_names=["score"],
         dynamic_axes={"board": {0: "batch"}, "aux": {0: "batch"}, "score": {0: "batch"}},
-        opset_version=17,
+        opset_version=18,
+        external_data=False,
     )
     print(f"ONNX exported: {path}")
 
