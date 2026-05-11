@@ -12,7 +12,12 @@ package main
 
 import (
 	"fmt"
+	"math/rand"
+	"os"
+	"runtime"
+	"sort"
 	"sync"
+	"time"
 
 	ort "github.com/yalue/onnxruntime_go"
 )
@@ -205,6 +210,29 @@ func (c *nnCtxV2) eval(b *board) int {
 	return int(v + 0.5)
 }
 
+func (c *nnCtxV2) evalRaw(b *board) float32 {
+	var nz, cellSum int
+	for i := 0; i < nRows; i++ {
+		for j := 0; j < nCols; j++ {
+			v := b[i][j]
+			c.inBoard[i*nCols+j] = float32(v) / 9.0
+			if v > 0 {
+				nz++
+				cellSum += int(v)
+			}
+		}
+	}
+	nzF := float32(nz) / float32(nTotal)
+	c.inAux[0] = nzF
+	c.inAux[1] = float32(nz) * float32(nz-1) / (float32(nTotal) * float32(nTotal))
+	c.inAux[2] = float32(cellSum) / (float32(nTotal) * 9.0)
+
+	if err := c.session.Run(); err != nil {
+		panic("nnCtxV2.evalRaw: " + err.Error())
+	}
+	return c.out[0]
+}
+
 // playModelAnA is AnA with the NN as evaluator instead of Greedy.
 // Drop-in replacement: same structure as playMCGreedyAllCands,
 // but nc.eval(&b2) replaces playGreedy(b2).
@@ -252,6 +280,199 @@ func playModelAnA(b board, nc *nnCtxV2) int {
 // 안A (playMCGreedyAllCands) 와 동일하지만
 // 후보 평가를 playGreedy 대신 NN 추론으로 수행한다.
 // → 목적: NN이 Greedy보다 더 나은 평가 함수 역할을 하는지 검증.
+
+const (
+	defaultNNRerankTopK        = 8
+	defaultNNRerankModelWeight = 0.5
+)
+
+type nnRerankCand struct {
+	r       rect
+	b       board
+	removed int
+	future  int
+	base    int
+	model   float32
+}
+
+func playNNRerankAnA(b board, nc *nnCtxV2) int {
+	return playNNRerankAnAWithParams(b, nc, defaultNNRerankTopK, defaultNNRerankModelWeight)
+}
+
+func playNNRerankAnAWithParams(b board, nc *nnCtxV2, topK int, modelWeight float32) int {
+	var val, cnt ps2d
+	removed := 0
+	if topK < 1 {
+		topK = 1
+	}
+
+	for {
+		buildPS(&b, &val, &cnt)
+		cands := make([]nnRerankCand, 0, 128)
+		for r1 := 0; r1 < nRows; r1++ {
+			for r2 := r1; r2 < nRows; r2++ {
+				for c1 := 0; c1 < nCols; c1++ {
+					for c2 := c1; c2 < nCols; c2++ {
+						if qps(&val, r1, c1, r2, c2) != 10 || qps(&cnt, r1, c1, r2, c2) == 0 {
+							continue
+						}
+						r := rect{int8(r1), int8(c1), int8(r2), int8(c2)}
+						b2 := b
+						nRemoved := applyRect(&b2, r)
+						future := playGreedy(b2)
+						cands = append(cands, nnRerankCand{
+							r:       r,
+							b:       b2,
+							removed: nRemoved,
+							future:  future,
+							base:    nRemoved + future,
+						})
+					}
+				}
+			}
+		}
+		if len(cands) == 0 {
+			break
+		}
+
+		sort.Slice(cands, func(i, j int) bool {
+			if cands[i].base != cands[j].base {
+				return cands[i].base > cands[j].base
+			}
+			if cands[i].future != cands[j].future {
+				return cands[i].future > cands[j].future
+			}
+			return cands[i].removed > cands[j].removed
+		})
+
+		top := topK
+		if len(cands) < top {
+			top = len(cands)
+		}
+		best := 0
+		bestScore := float32(cands[0].base) / float32(nTotal)
+		for i := 0; i < top; i++ {
+			cands[i].model = nc.evalRaw(&cands[i].b)
+			score := float32(cands[i].base)/float32(nTotal) + modelWeight*cands[i].model
+			if score > bestScore || (score == bestScore && cands[i].base > cands[best].base) {
+				best = i
+				bestScore = score
+			}
+		}
+
+		removed += applyRect(&b, cands[best].r)
+	}
+
+	return removed
+}
+
+func runNNRerankAnAvsAnA(n int, modelPath, libPath string) {
+	runNNRerankAnAvsAnAWithParams(n, modelPath, libPath, defaultNNRerankTopK, defaultNNRerankModelWeight)
+}
+
+func runNNRerankAnAvsAnAWithParams(n int, modelPath, libPath string, topK int, modelWeight float64) {
+	if err := InitNN(modelPath, libPath); err != nil {
+		fmt.Fprintf(os.Stderr, "ONNX init error: %v\n", err)
+		os.Exit(1)
+	}
+
+	master := rand.New(rand.NewSource(time.Now().UnixNano()))
+	boards := make([]board, n)
+	for i := range boards {
+		boards[i] = genBoard(master)
+	}
+
+	type result struct{ ana, rerank int }
+	results := make([]result, n)
+
+	var (
+		mu        sync.Mutex
+		completed int
+		totalDur  time.Duration
+	)
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, runtime.NumCPU())
+
+	fmt.Printf("AnA  vs  NNRerankAnA(topK=%d, weight=%.3f)  --  %d boards  --  %d CPUs\n  model: %s\n\n",
+		topK, modelWeight, n, runtime.NumCPU(), modelPath)
+	overallStart := time.Now()
+
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(idx int) {
+			defer func() { <-sem; wg.Done() }()
+			nc, err := newNNCtxV2(modelPath)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "session error: %v\n", err)
+				os.Exit(1)
+			}
+			defer nc.destroy()
+
+			t0 := time.Now()
+			b := boards[idx]
+			ana := playMCGreedyAllCands(b)
+			rerank := playNNRerankAnAWithParams(b, nc, topK, float32(modelWeight))
+			dur := time.Since(t0)
+
+			mu.Lock()
+			completed++
+			totalDur += dur
+			eta := (totalDur / time.Duration(completed)) * time.Duration(n-completed)
+			best := ana
+			if rerank > best {
+				best = rerank
+			}
+			as, rs := " ", " "
+			if ana == best {
+				as = "*"
+			}
+			if rerank == best {
+				rs = "*"
+			}
+			diff := rerank - ana
+			sign := "+"
+			if diff < 0 {
+				sign = ""
+			}
+			fmt.Printf("[%2d/%d]  AnA:%3d%s  Rerank:%3d%s  (%s%d)   %6.1fs  ETA %v\n",
+				completed, n, ana, as, rerank, rs, sign, diff,
+				dur.Seconds(), eta.Round(time.Second))
+			mu.Unlock()
+			results[idx] = result{ana, rerank}
+		}(i)
+	}
+	wg.Wait()
+
+	type stat struct{ sum, min, max int }
+	st := [2]stat{{0, nTotal + 1, 0}, {0, nTotal + 1, 0}}
+	wins := [2]int{}
+	for _, r := range results {
+		vals := [2]int{r.ana, r.rerank}
+		best := 0
+		for _, v := range vals {
+			if v > best {
+				best = v
+			}
+		}
+		for i, v := range vals {
+			st[i].sum += v
+			if v < st[i].min {
+				st[i].min = v
+			}
+			if v > st[i].max {
+				st[i].max = v
+			}
+			if v == best {
+				wins[i]++
+			}
+		}
+	}
+	names := [2]string{"AnA", "NNRerankAnA"}
+	printStatTable(names[:], st[0].sum, st[1].sum, st[0].min, st[1].min, st[0].max, st[1].max, wins[0], wins[1], n)
+	fmt.Printf("  Rerank gain : %+.2f\n", float64(st[1].sum-st[0].sum)/float64(n))
+	fmt.Printf("  Total time  : %v\n", time.Since(overallStart).Round(time.Millisecond))
+}
 
 func playMCNNAllCands(b board, nc *nnCtx) int {
 	var val, cnt ps2d

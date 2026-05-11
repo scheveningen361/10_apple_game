@@ -21,4 +21,15 @@ type nnCtxV2 struct{}
 func newNNCtxV2(modelPath string) (*nnCtxV2, error) { panic("NN not built in") }
 func (c *nnCtxV2) destroy()                         {}
 func (c *nnCtxV2) eval(b *board) int                { panic("NN not built in") }
+func (c *nnCtxV2) evalRaw(b *board) float32         { panic("NN not built in") }
 func playModelAnA(b board, nc *nnCtxV2) int         { panic("NN not built in") }
+func playNNRerankAnA(b board, nc *nnCtxV2) int      { panic("NN not built in") }
+func playNNRerankAnAWithParams(b board, nc *nnCtxV2, topK int, modelWeight float32) int {
+	panic("NN not built in")
+}
+func runNNRerankAnAvsAnA(n int, modelPath, libPath string) {
+	panic("NN not built in")
+}
+func runNNRerankAnAvsAnAWithParams(n int, modelPath, libPath string, topK int, modelWeight float64) {
+	panic("NN not built in")
+}

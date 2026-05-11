@@ -33,8 +33,13 @@ func main() {
 	greedyOnly := flag.Bool("greedy-only", false, "Greedy benchmark only")
 	genGames := flag.Int("gen", 0, "generate training data: number of games (0=off)")
 	genOut := flag.String("out", "data/generated/training_data.bin", "output file for -gen")
+	genRank := flag.Int("gen-rank", 0, "generate ranking data: number of games (0=off)")
+	rankOut := flag.String("rank-out", "data/generated/rank_data.bin", "output file for -gen-rank")
 	nnMode := flag.Bool("nn", false, "AnA vs AnA-NN comparison (requires -tags nn build, old single-input model)")
 	nnAnaMode := flag.Bool("nn-ana", false, "AnA vs ModelAnA comparison (requires -tags nn build, ResNet+aux model)")
+	nnRerankMode := flag.Bool("nn-rerank", false, "AnA vs NN-reranked top-K AnA comparison (requires -tags nn build)")
+	nnRerankTopK := flag.Int("rerank-k", 8, "top-K heuristic candidates for -nn-rerank")
+	nnRerankWeight := flag.Float64("rerank-weight", 0.5, "model score weight for -nn-rerank")
 	modelPath := flag.String("model", "models/model.onnx", "ONNX model file path")
 	ortLib := flag.String("ort-lib", "runtime/onnxruntime.dll", "ONNX Runtime shared library path")
 	perfectMode := flag.Bool("perfect", false, "search for perfect-score board with AnA")
@@ -46,6 +51,7 @@ func main() {
 	randomBench := flag.Bool("random-bench", false, "Random play large-scale benchmark")
 	randomOut := flag.String("random-out", "", "Random play scores output file")
 	solverMode := flag.Bool("solver", false, "stdin board -> AnA moves stdout (macro integration)")
+	improvedAnAMode := flag.Bool("improved-ana", false, "ImprovedAnA vs AnA comparison")
 	niaMode := flag.Bool("nia", false, "NIA vs AnA comparison")
 	ranaMode := flag.Bool("rana", false, "RAnA (Best-of-K Randomized AnA) vs AnA comparison")
 	ranaK := flag.Int("k", 3, "K for RAnA: number of random restarts")
@@ -58,6 +64,8 @@ func main() {
 		runSolverMode()
 	case *genSL > 0:
 		runGenSL(*genSL, *slOut)
+	case *genRank > 0:
+		runGenRank(*genRank, *rankOut)
 	case *genGames > 0:
 		fmt.Printf("Generating training data: %d Greedy games -> %s\n\n", *genGames, *genOut)
 		runGenerate(*genGames, *genOut)
@@ -67,6 +75,8 @@ func main() {
 		runNNComparison(*n, *modelPath, *ortLib)
 	case *nnAnaMode:
 		runModelAnAvsAnA(*n, *modelPath, *ortLib)
+	case *nnRerankMode:
+		runNNRerankAnAvsAnAWithParams(*n, *modelPath, *ortLib, *nnRerankTopK, *nnRerankWeight)
 	case *perfectMode:
 		runFindPerfect(*perfectOut)
 	case *greedyBench:
@@ -75,6 +85,8 @@ func main() {
 		runRandomBench(*n, *randomOut)
 	case *anaOnly:
 		runAnaOnly(*n, *anaOut)
+	case *improvedAnAMode:
+		runImprovedAnAvsAnA(*n)
 	case *niaMode:
 		runNIAvsAnA(*n)
 	case *ranaMode:
